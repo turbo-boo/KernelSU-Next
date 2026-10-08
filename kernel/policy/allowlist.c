@@ -1,3 +1,5 @@
+#include <linux/namei.h>
+#include <linux/mount.h>
 #include <linux/rcupdate.h>
 #include <linux/limits.h>
 #include <linux/rculist.h>
@@ -94,6 +96,7 @@ static uint8_t allow_list_bitmap[PAGE_SIZE] __read_mostly __aligned(PAGE_SIZE);
 #define BITMAP_UID_MAX ((sizeof(allow_list_bitmap) * BITS_PER_BYTE) - 1)
 
 #define KERNEL_SU_ALLOWLIST "/data/adb/ksu/.allowlist"
+#define KERNEL_SU_ALLOWLIST_TMP KERNEL_SU_ALLOWLIST ".tmp"
 
 void ksu_persistent_allow_list(void);
 
@@ -468,45 +471,149 @@ bool ksu_get_allow_list(int *array, u16 length, u16 *out_length, u16 *out_total,
 
 static struct work_struct ksu_save_allow_list_work;
 
+static int write_allowlist_data(struct file *fp, const void *data,
+				size_t size, loff_t *off)
+{
+	const char *ptr = data;
+
+	while (size) {
+		ssize_t written = ksu_kernel_write_compat(fp, ptr, size, off);
+
+		if (written < 0)
+			return written;
+		if (!written)
+			return -EIO;
+		ptr += written;
+		size -= written;
+	}
+	return 0;
+}
+
+static int replace_allowlist_file(void)
+{
+	struct path dir;
+	struct dentry *old_dentry, *new_dentry;
+	struct inode *dir_inode;
+	struct file *dir_file;
+	int error;
+
+	error = kern_path("/data/adb/ksu", LOOKUP_FOLLOW, &dir);
+	if (error)
+		return error;
+	dir_file = dentry_open(&dir, O_RDONLY | O_DIRECTORY, current_cred());
+	if (IS_ERR(dir_file)) {
+		error = PTR_ERR(dir_file);
+		goto out_path;
+	}
+
+	error = mnt_want_write(dir.mnt);
+	if (error)
+		goto out_close;
+
+	lock_rename(dir.dentry, dir.dentry);
+	old_dentry = lookup_one_len(".allowlist.tmp", dir.dentry,
+				    sizeof(".allowlist.tmp") - 1);
+	if (IS_ERR(old_dentry)) {
+		error = PTR_ERR(old_dentry);
+		goto out_unlock;
+	}
+	new_dentry = lookup_one_len(".allowlist", dir.dentry,
+				    sizeof(".allowlist") - 1);
+	if (IS_ERR(new_dentry)) {
+		error = PTR_ERR(new_dentry);
+		dput(old_dentry);
+		goto out_unlock;
+	}
+
+	dir_inode = d_inode(dir.dentry);
+	error = vfs_rename(dir_inode, old_dentry, dir_inode, new_dentry,
+			   NULL, 0);
+	dput(new_dentry);
+	dput(old_dentry);
+out_unlock:
+	unlock_rename(dir.dentry, dir.dentry);
+	mnt_drop_write(dir.mnt);
+	if (!error)
+		error = vfs_fsync(dir_file, 0);
+out_close:
+	filp_close(dir_file, 0);
+out_path:
+	path_put(&dir);
+	return error;
+}
+
 static void do_persistent_allow_list(struct work_struct *work)
 {
-    u32 magic = FILE_MAGIC;
-    u32 version = FILE_FORMAT_VERSION;
-    struct perm_data *p = NULL;
-    loff_t off = 0;
+	u32 magic = FILE_MAGIC;
+	u32 version = FILE_FORMAT_VERSION;
+	struct perm_data *p = NULL;
+	loff_t off = 0;
+	int error;
+	struct file *fp;
+	const struct cred *saved;
+	/*
+	 * Workqueue workers have no session keyring, so opening files under the
+	 * FBE-encrypted /data/adb/ksu fails with -ENOKEY.  Save through a
+	 * private copy of ksu_cred with init's session keyring installed.
+	 */
+	struct cred *session_cred = ksu_compat_prepare_session_cred(ksu_cred);
 
-    const struct cred *saved = override_creds(ksu_cred);
-    struct file *fp =
-        ksu_filp_open_compat(KERNEL_SU_ALLOWLIST, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (IS_ERR(fp)) {
-        pr_err("save_allow_list create file failed: %ld\n", PTR_ERR(fp));
-        goto out;
-    }
+	saved = override_creds(session_cred ? session_cred : ksu_cred);
 
-	// store magic and version
-	if (ksu_kernel_write_compat(fp, &magic, sizeof(magic), &off) != sizeof(magic)) {
-		pr_err("save_allow_list write magic failed.\n");
+	fp = ksu_filp_open_compat(KERNEL_SU_ALLOWLIST_TMP,
+				  O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (IS_ERR(fp)) {
+		pr_err("save_allow_list create temp file failed: %ld\n",
+		       PTR_ERR(fp));
+		goto out;
+	}
+
+	error = write_allowlist_data(fp, &magic, sizeof(magic), &off);
+	if (error) {
+		pr_err("save_allow_list write magic failed: %d\n", error);
+		goto close_file;
+	}
+	error = write_allowlist_data(fp, &version, sizeof(version), &off);
+	if (error) {
+		pr_err("save_allow_list write version failed: %d\n", error);
 		goto close_file;
 	}
 
-	if (ksu_kernel_write_compat(fp, &version, sizeof(version), &off) != sizeof(version)) {
-		pr_err("save_allow_list write version failed.\n");
+	mutex_lock(&allowlist_mutex);
+	list_for_each_entry (p, &allow_list, list) {
+		error = write_allowlist_data(fp, &p->profile,
+					     sizeof(p->profile), &off);
+		if (error) {
+			pr_err("save_allow_list profile write failed: %d\n",
+			       error);
+			break;
+		}
+	}
+	mutex_unlock(&allowlist_mutex);
+	if (error)
+		goto close_file;
+
+	error = vfs_fsync(fp, 0);
+	if (error) {
+		pr_err("save_allow_list temp file sync failed: %d\n", error);
 		goto close_file;
 	}
-
-    mutex_lock(&allowlist_mutex);
-    list_for_each_entry (p, &allow_list, list) {
-        pr_info("save allow list, name: %s uid :%d, allow: %d\n",
-                p->profile.key, p->profile.current_uid, p->profile.allow_su);
-
-        ksu_kernel_write_compat(fp, &p->profile, sizeof(p->profile), &off);
-    }
-    mutex_unlock(&allowlist_mutex);
+	filp_close(fp, 0);
+	error = replace_allowlist_file();
+	if (error)
+		pr_err("save_allow_list atomic replace failed: %d\n", error);
+	goto out;
 
 close_file:
-    filp_close(fp, 0);
+	filp_close(fp, 0);
 out:
-    revert_creds(saved);
+	revert_creds(saved);
+	/*
+	 * The credential was only ever referenced by override_creds(), so it is
+	 * unreferenced again here; put it now that the save is finished.
+	 */
+	if (session_cred)
+		put_cred(session_cred);
 }
 
 void ksu_persistent_allow_list(void)
@@ -523,9 +630,10 @@ void ksu_load_allow_list()
 	loff_t off = 0;
 	ssize_t ret = 0;
 	struct file *fp = NULL;
-	u32 magic;
-	u32 version;
-    size_t app_profile_size;
+	u32 magic = 0;
+	u32 version = 0;
+	size_t app_profile_size;
+	bool load_error = false;
 
 #ifdef CONFIG_KSU_DEBUG
 	// always allow adb shell by default
@@ -539,15 +647,19 @@ void ksu_load_allow_list()
 		return;
 	}
 
-	// verify magic
-	if (ksu_kernel_read_compat(fp, &magic, sizeof(magic), &off) != sizeof(magic) ||
-	    magic != FILE_MAGIC) {
-		pr_err("allowlist file invalid: %d!\n", magic);
+	ret = ksu_kernel_read_compat(fp, &magic, sizeof(magic), &off);
+	if (ret != sizeof(magic)) {
+		pr_err("allowlist magic read failed: %zd\n", ret);
+		goto exit;
+	}
+	if (magic != FILE_MAGIC) {
+		pr_err("allowlist file invalid: %08x\n", magic);
 		goto exit;
 	}
 
-	if (ksu_kernel_read_compat(fp, &version, sizeof(version), &off) != sizeof(version)) {
-		pr_err("allowlist read version: %d failed\n", version);
+	ret = ksu_kernel_read_compat(fp, &version, sizeof(version), &off);
+	if (ret != sizeof(version)) {
+		pr_err("allowlist version read failed: %zd\n", ret);
 		goto exit;
 	}
 
@@ -563,26 +675,34 @@ void ksu_load_allow_list()
 	app_profile_size = version < KSU_APP_PROFILE_VER ? kAppProfileSizePreV4 : sizeof(struct app_profile);
 
 	while (true) {
-		struct app_profile profile;
+		struct app_profile profile = {};
 
 		ret = ksu_kernel_read_compat(fp, &profile, app_profile_size, &off);
 
 		if (ret != app_profile_size) {
-			if (ret != 0)
-				pr_info("load_allow_list read err: %zd\n", ret);
+			if (ret < 0 || ret > 0) {
+				pr_err("load_allow_list profile read failed: %zd\n",
+				       ret);
+				load_error = true;
+			}
 			break;
 		}
 
-        migrate_profile(version, &profile);
+		migrate_profile(version, &profile);
 
-        pr_info("load_allow_uid, name: %s, uid: %d, allow: %d\n", profile.key,
-                profile.current_uid, profile.allow_su);
-        ksu_set_app_profile(&profile);
-    }
+		pr_info("load_allow_uid, name: %s, uid: %d, allow: %d\n",
+			profile.key, profile.current_uid, profile.allow_su);
+		ret = ksu_set_app_profile(&profile);
+		if (ret) {
+			pr_err("load_allow_list profile rejected: %d\n", ret);
+			load_error = true;
+			break;
+		}
+	}
 
 	ksu_show_allow_list();
 	filp_close(fp, 0);
-	if (version < KSU_APP_PROFILE_VER)
+	if (version < KSU_APP_PROFILE_VER && !load_error)
 		ksu_persistent_allow_list();
 	return;
 
@@ -652,6 +772,12 @@ void __exit ksu_allowlist_exit(void)
 	struct perm_data *n = NULL;
 
     cancel_work_sync(&ksu_save_allow_list_work);
+
+	/*
+	 * No save can be in flight any more, so drop the reference the save path
+	 * took on init's session keyring.
+	 */
+	ksu_compat_release_session_keyring();
 
 	// free allowlist
 	mutex_lock(&allowlist_mutex);

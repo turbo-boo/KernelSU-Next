@@ -7,8 +7,128 @@
 #endif
 #include <linux/uaccess.h>
 #include <linux/fdtable.h>
+#include <linux/key.h>
+#include <linux/cred.h>
 #include "klog.h" // IWYU pragma: keep
 #include "kernel_compat.h"
+
+#ifdef KSU_HAS_INIT_SESSION_KEYRING
+static struct key *init_session_keyring __read_mostly;
+static bool init_session_keyring_closed __read_mostly;
+
+/*
+ * Capture init's session keyring the first time one is available.
+ *
+ * init installs its session keyring early in second stage and vold then links
+ * the "fscrypt" keyring into it, so the first key operation init performs may
+ * still observe a NULL session keyring.  Retry on later operations instead of
+ * latching the NULL.
+ *
+ * Called from the key_permission LSM hook, the only place we see init's creds.
+ * That hook cannot be unregistered on this kernel, so teardown is handled by
+ * the closed flag: a capture that races with release undoes itself.
+ */
+void ksu_compat_capture_session_keyring(const struct cred *cred)
+{
+	struct key *keyring;
+
+	if (READ_ONCE(init_session_keyring_closed))
+		return;
+	if (READ_ONCE(init_session_keyring) != NULL)
+		return;
+
+	rcu_read_lock();
+	keyring = key_get(rcu_dereference(cred->session_keyring));
+	rcu_read_unlock();
+	if (!keyring) {
+		// Not installed yet, retry on the next key operation.
+		return;
+	}
+
+	if (cmpxchg(&init_session_keyring, NULL, keyring)) {
+		// Another thread captured it first.
+		key_put(keyring);
+		return;
+	}
+
+	if (READ_ONCE(init_session_keyring_closed)) {
+		// Raced with teardown; give the reference back.
+		key_put(xchg(&init_session_keyring, NULL));
+		return;
+	}
+
+	pr_info("kernel_compat: got init_session_keyring\n");
+}
+
+/*
+ * Clone @base and install init's session keyring into the copy.
+ *
+ * The copy keeps every attribute of @base - notably its SELinux context and
+ * capabilities - and only adds the session keyring that holds the FBE/fscrypt
+ * "logon" keys.  It is used with override_creds()/revert_creds() around the
+ * allowlist save so that the request_key() performed by ext4/f2fs can find the
+ * encryption key even when the caller is a workqueue worker, which has no
+ * session keyring of its own.
+ *
+ * Neither @base nor the caller's credentials are modified.
+ *
+ * Returns NULL when no keyring has been captured or when it is no longer
+ * usable, in which case the caller falls back to @base alone.
+ */
+struct cred *ksu_compat_prepare_session_cred(const struct cred *base)
+{
+	const struct cred *saved;
+	struct key *keyring;
+	struct cred *cred;
+
+	if (!base)
+		return NULL;
+
+	rcu_read_lock();
+	keyring = key_get(rcu_dereference(init_session_keyring));
+	rcu_read_unlock();
+	if (!keyring)
+		return NULL;
+
+	/* init may have replaced or revoked the keyring after we cached it */
+	if (key_validate(keyring)) {
+		key_put(keyring);
+		return NULL;
+	}
+
+	/*
+	 * prepare_creds() clones current's credentials, so temporarily assume
+	 * @base in order to inherit its SELinux context.
+	 */
+	saved = override_creds(base);
+	cred = prepare_creds();
+	revert_creds(saved);
+	if (!cred) {
+		key_put(keyring);
+		return NULL;
+	}
+
+	/*
+	 * Release the reference prepare_creds() took on the cloned session
+	 * keyring; we are replacing it, not adding to it.
+	 */
+	key_put(cred->session_keyring);
+	rcu_assign_pointer(cred->session_keyring, keyring);
+	return cred;
+}
+
+/*
+ * Drop the reference taken by ksu_compat_capture_session_keyring() and stop
+ * capturing, so no reference can outlive the module.
+ * Called at module teardown, after synchronize_rcu().
+ */
+void ksu_compat_release_session_keyring(void)
+{
+	WRITE_ONCE(init_session_keyring_closed, true);
+	key_put(xchg(&init_session_keyring, NULL));
+}
+#endif /* KSU_HAS_INIT_SESSION_KEYRING */
+
 
 struct file *ksu_filp_open_compat(const char *filename, int flags, umode_t mode)
 {

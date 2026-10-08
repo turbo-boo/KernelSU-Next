@@ -35,9 +35,37 @@ extern ssize_t ksu_kernel_read_compat(struct file *p, void *buf, size_t count,
 extern ssize_t ksu_kernel_write_compat(struct file *p, const void *buf,
 				       size_t count, loff_t *pos);
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 10, 0) ||                           \
-	defined(CONFIG_IS_HW_HISI) || defined(CONFIG_KSU_ALLOWLIST_WORKAROUND)
-extern struct key *init_session_keyring;
+/*
+ * FBE/fscrypt "logon" keys are kept in the session keyring that init installs
+ * (init calls keyctl_get_keyring_ID(KEY_SPEC_SESSION_KEYRING, 1) early in
+ * second stage).  Workqueue workers - such as the allowlist save path - have no
+ * session keyring, so opening files under the FBE-encrypted /data/adb/ksu fails
+ * with -ENOKEY.
+ *
+ * Capture that keyring from init and install it into a private credential that
+ * is used only by the save worker; neither ksu_cred nor the worker's own creds
+ * are modified.
+ */
+struct cred;
+#if defined(CONFIG_KEYS) &&                                                     \
+	(LINUX_VERSION_CODE < KERNEL_VERSION(4, 10, 0) ||                      \
+	 defined(CONFIG_IS_HW_HISI) || defined(CONFIG_KSU_ALLOWLIST_WORKAROUND))
+#define KSU_HAS_INIT_SESSION_KEYRING
+void ksu_compat_capture_session_keyring(const struct cred *cred);
+struct cred *ksu_compat_prepare_session_cred(const struct cred *base);
+void ksu_compat_release_session_keyring(void);
+#else
+static inline void ksu_compat_capture_session_keyring(const struct cred *cred)
+{
+}
+static inline struct cred *
+ksu_compat_prepare_session_cred(const struct cred *base)
+{
+	return NULL;
+}
+static inline void ksu_compat_release_session_keyring(void)
+{
+}
 #endif
 
 extern long ksu_copy_from_user_nofault(void *dst, const void __user *src, size_t size);

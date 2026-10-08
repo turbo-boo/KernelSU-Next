@@ -13,25 +13,19 @@
 
 #ifndef KSU_KPROBES_HOOK
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 10, 0) ||                           \
-	defined(CONFIG_IS_HW_HISI) || defined(CONFIG_KSU_ALLOWLIST_WORKAROUND)
-struct key *init_session_keyring = NULL;
-
+#ifdef KSU_HAS_INIT_SESSION_KEYRING
 static int ksu_key_permission(key_ref_t key_ref, const struct cred *cred,
 			      unsigned perm)
 {
-	if (init_session_keyring != NULL) {
-		return 0;
-	}
 	if (strcmp(current->comm, "init")) {
 		// we are only interested in `init` process
 		return 0;
 	}
-	init_session_keyring = cred->session_keyring;
-	pr_info("kernel_compat: got init_session_keyring\n");
+
+	ksu_compat_capture_session_keyring(cred);
 	return 0;
 }
-#endif
+#endif // KSU_HAS_INIT_SESSION_KEYRING
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
 static int ksu_inode_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry *old_dentry,
@@ -128,8 +122,7 @@ int ksu_inode_permission(struct inode *inode, int mask)
 }
 
 static struct security_hook_list ksu_hooks[] = {
-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 10, 0) ||                           \
-	defined(CONFIG_IS_HW_HISI) || defined(CONFIG_KSU_ALLOWLIST_WORKAROUND)
+#ifdef KSU_HAS_INIT_SESSION_KEYRING
 	LSM_HOOK_INIT(key_permission, ksu_key_permission),
 #endif
 	LSM_HOOK_INIT(inode_permission, ksu_inode_permission),
